@@ -25,16 +25,19 @@ API credits 计费）相互独立：本插件的登录拿到的是 **Vibe Code �
 
 ## 安装
 
-magpie 里 `magpie plugin add github:songlairui/magpie-mistral-code#v0.1.0`（打 tag 安装），
+magpie 里 `magpie plugin add github:songlairui/magpie-mistral-code#v0.1.1`（打 tag 安装），
 然后 `magpie plugin login mistral-vibe`。OpenCode 里把包名加进配置即可。
 
 模型列表来自 `GET /v1/models`：context 优先取它自己的 `max_context_length`，名称、输出
-上限和能力优先取 models.dev 的 `mistral` 目录，接口的 `capabilities` 优先于 models.dev。
+上限优先取 models.dev 的 `mistral` 目录；能力以接口的 `capabilities` 为准，并写进模型的
+`capabilities`/`modalities`。TTS、OCR、embedding 这类不产出文本的模型因此不会出现在
+magpie 的聊天模型列表里（OpenCode 也会读到这些能力）。
 
 ## 价格
 
 价格对齐 [Mistral 官方定价](https://docs.mistral.ai/inference/pricing)（USD / 1M tokens，
-standard 档），覆盖当前在售的 LLM 模型：
+standard 档），覆盖当前在售的 LLM 模型。这些是 API 列表价，用于 OpenCode/magpie 的费用
+估算；Vibe Code 套餐内实际消耗的是月度 Vibe Code 预算：
 
 | 模型 | Input | Cached input | Output |
 | --- | ---: | ---: | ---: |
@@ -48,11 +51,12 @@ standard 档），覆盖当前在售的 LLM 模型：
 | Z.ai GLM 5.3 | 1.40 | 0.14 | 4.40 |
 | DeepSeek V4.1 Flash 1017 | 0.30 | 0.007 | 1.20 |
 
-`/v1/models` 的 `billing_model_name` 决定别名按哪个模型计价，所以 `codestral-latest`、
-`mistral-code-latest` 等别名会和它背后的 `codestral-2508` 同价；`mistral-large-latest`
-仍按它实际结算的 Mistral Large 3 计价，不会误标成 Large 4。旧版本和语音、OCR、embedding
-模型不在上面的表里，若 models.dev 认识它们就沿用 models.dev 的价格；都不认识时宁可不标价，
-也不写 0。
+`/v1/models` 的 `billing_model_name`（以及它给出的 `aliases`）决定别名按哪个模型计价，所以
+`codestral-latest`、`mistral-code-latest` 等别名会和它背后的 `codestral-2508` 同价；
+`mistral-large-latest` 仍按它实际结算的 Mistral Large 3 计价，不会误标成 Large 4。旧版本
+和语音、OCR、embedding 模型不在上面的表里；语音和非聊天模型不沿用 models.dev 的价格
+（那边可能是按分钟、页或字符计价），其余旧 LLM 若 models.dev 认识就沿用它的价格。都不认识
+时宁可不标价，也不写 0。
 
 ## 测试
 

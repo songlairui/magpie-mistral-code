@@ -195,14 +195,31 @@ test("provider.models lists /v1/models as mistral-vibe models", async () => {
 })
 
 test("prices follow the Mistral docs and each model's billing name", () => {
-  const { priceOf } = _internal
+  const { priceOf, DOCS_PRICES } = _internal
   const large4 = { input: 0.7, output: 2.1, cache: { read: 0.07, write: 0 } }
   const codestral = { input: 0.3, output: 0.9, cache: { read: 0.03, write: 0 } }
-  expect(priceOf({ id: "mistral-large-4" }, {})).toEqual(large4)
+  const documented = {
+    "mistral-large-4": [0.7, 2.1, 0.07],
+    "mistral-large-4-0": [0.7, 2.1, 0.07],
+    "mistral-large-4-0-a": [0.7, 2.1, 0.07],
+    "mistral-small-2603": [0.15, 0.6, 0.015],
+    "ministral-14b-2512": [0.2, 0.2, 0.02],
+    "ministral-8b-2512": [0.15, 0.15, 0.015],
+    "ministral-3b-2512": [0.1, 0.1, 0.01],
+    "codestral-2508": [0.3, 0.9, 0.03],
+    "zai-glm-5-3": [1.4, 4.4, 0.14],
+    "zai-glm-5-3-flash": [0.15, 0.5, 0.03],
+    "deepseek-v4-1-flash-1017": [0.3, 1.2, 0.007],
+  }
+  expect(Object.keys(DOCS_PRICES).sort()).toEqual(Object.keys(documented).sort())
+  for (const [id, [input, output, read]] of Object.entries(documented))
+    expect(priceOf({ id }, {})).toEqual({ input, output, cache: { read, write: 0 } })
+  // an alias is priced at the model the vendor bills it as
   expect(priceOf({ id: "mistral-large-4-0", billing_model_name: "mistral-large-4-0-a" }, {})).toEqual(large4)
   expect(priceOf({ id: "mistral-code-latest", billing_model_name: "codestral-2508" }, {})).toEqual(codestral)
-  expect(priceOf({ id: "deepseek-v4-1-flash-1017" }, {})).toEqual({ input: 0.3, output: 1.2, cache: { read: 0.007, write: 0 } })
-  expect(priceOf({ id: "zai-glm-5-3-flash" }, {})).toEqual({ input: 0.15, output: 0.5, cache: { read: 0.03, write: 0 } })
+  // and through /v1/models's aliases when the billing name is not given
+  expect(priceOf({ id: "zai-glm-latest", aliases: ["zai-glm-5-3", "zai-glm-5"] }, {})).toEqual({ input: 1.4, output: 4.4, cache: { read: 0.14, write: 0 } })
+  expect(priceOf({ id: "mistral-code-latest", aliases: ["codestral-2508", "codestral-latest"] }, {})).toEqual(codestral)
   // mistral-large-latest is billed as Mistral Large 3, not as Large 4
   expect(priceOf({ id: "mistral-large-latest", billing_model_name: "mistral-large-2512" }, {})).toBeUndefined()
   // models.dev prices a model the docs no longer list
@@ -211,6 +228,24 @@ test("prices follow the Mistral docs and each model's billing name", () => {
     output: 1.5,
     cache: { read: 0.05, write: 0 },
   })
+  // the billing name and its aliases come before the alias's own stale entry
+  const medium = { input: 1.5, output: 7.5, cache: { read: 0.15, write: 0 } }
+  expect(
+    priceOf(
+      { id: "magistral-medium-latest", billing_model_name: "mistral-medium-3-5", aliases: ["mistral-medium-latest"] },
+      {
+        "mistral-medium-latest": { cost: { input: 1.5, output: 7.5, cache_read: 0.15 } },
+        "magistral-medium-latest": { cost: { input: 2, output: 5, cache_read: 0 } },
+      }
+    )
+  ).toEqual(medium)
+  // a speech or non-chat model's models.dev price may not be per token
+  expect(
+    priceOf({ id: "voxtral-small-2507", capabilities: { completion_chat: true, audio: true } }, { "voxtral-small-2507": { cost: { input: 0.1, output: 0.4 } } })
+  ).toBeUndefined()
+  expect(
+    priceOf({ id: "codestral-embed", capabilities: { completion_chat: false } }, { "codestral-embed": { cost: { input: 0.1, output: 0 } } })
+  ).toBeUndefined()
   // nothing known is no price, not a zero
   expect(priceOf({ id: "unknown" }, {})).toBeUndefined()
 })

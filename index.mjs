@@ -35,10 +35,10 @@ const SIGN_IN_TTL_MS = 10 * 60 * 1000
 const DEFAULT_LIMIT = { context: 262_144, output: 65_536 }
 
 // Prices from https://docs.mistral.ai/inference/pricing (USD per 1M tokens,
-// standard tier), for the current LLM models only. /v1/models names each
-// model's billing model as well (billing_model_name), so an alias such as
-// codestral-latest or mistral-code-latest is priced at the model behind it;
-// a -latest alias is also listed where it is that model's own id. Older
+// standard tier, checked 2026-11-06), for the current LLM models only. The
+// keys are the ids the docs and /v1/models agree on, plus Large 4's billing
+// name; an alias is priced through its own billing_model_name, so it follows
+// the model behind it rather than a price kept for the alias. Older
 // generations and the speech, OCR and embedding models keep models.dev's
 // price when it has one.
 const DOCS_PRICES = {
@@ -46,15 +46,10 @@ const DOCS_PRICES = {
   "mistral-large-4-0": { input: 0.7, output: 2.1, cache_read: 0.07 },
   "mistral-large-4-0-a": { input: 0.7, output: 2.1, cache_read: 0.07 },
   "mistral-small-2603": { input: 0.15, output: 0.6, cache_read: 0.015 },
-  "mistral-small-latest": { input: 0.15, output: 0.6, cache_read: 0.015 },
   "ministral-14b-2512": { input: 0.2, output: 0.2, cache_read: 0.02 },
-  "ministral-14b-latest": { input: 0.2, output: 0.2, cache_read: 0.02 },
   "ministral-8b-2512": { input: 0.15, output: 0.15, cache_read: 0.015 },
-  "ministral-8b-latest": { input: 0.15, output: 0.15, cache_read: 0.015 },
   "ministral-3b-2512": { input: 0.1, output: 0.1, cache_read: 0.01 },
-  "ministral-3b-latest": { input: 0.1, output: 0.1, cache_read: 0.01 },
   "codestral-2508": { input: 0.3, output: 0.9, cache_read: 0.03 },
-  "codestral-latest": { input: 0.3, output: 0.9, cache_read: 0.03 },
   "zai-glm-5-3": { input: 1.4, output: 4.4, cache_read: 0.14 },
   "zai-glm-5-3-flash": { input: 0.15, output: 0.5, cache_read: 0.03 },
   "deepseek-v4-1-flash-1017": { input: 0.3, output: 1.2, cache_read: 0.007 },
@@ -147,8 +142,17 @@ async function modelsDev() {
 // first, then models.dev, and undefined when nothing prices it rather than
 // a made-up zero.
 function priceOf(m, dev) {
+  const caps = m?.capabilities ?? {}
   const billing = typeof m?.billing_model_name === "string" ? m.billing_model_name : ""
-  const p = DOCS_PRICES[billing] ?? DOCS_PRICES[m?.id] ?? dev?.[billing]?.cost ?? dev?.[m?.id]?.cost
+  const aliases = Array.isArray(m?.aliases) ? m.aliases : []
+  const names = [billing, ...aliases, m?.id].filter((id) => typeof id === "string" && id)
+  const stated = names.map((id) => DOCS_PRICES[id]).find(Boolean)
+  // a speech or non-chat model's models.dev price may be per minute, page or
+  // character rather than per token, so only chat models without audio take it
+  const audio =
+    caps.audio === true || caps.audio_transcription === true || caps.audio_transcription_realtime === true || caps.audio_speech === true
+  const chat = caps.completion_chat ?? true
+  const p = stated ?? (chat && !audio ? names.map((id) => dev?.[id]?.cost).find(Boolean) : undefined)
   if (!p || typeof p !== "object") return undefined
   const n = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : 0)
   const cache = p.cache && typeof p.cache === "object" ? p.cache : {}
@@ -171,12 +175,15 @@ async function listModels(key) {
   for (const m of j?.data ?? []) {
     if (!m?.id || typeof m.id !== "string") continue
     const billing = typeof m.billing_model_name === "string" ? m.billing_model_name : ""
-    const d = dev[m.id] ?? dev[billing] ?? {}
+    const aliases = Array.isArray(m.aliases) ? m.aliases : []
+    const d = [billing, ...aliases, m.id].map((id) => dev[id]).find(Boolean) ?? {}
     const caps = m.capabilities ?? {}
     const image = caps.vision ?? d.attachment ?? false
     const reasoning = caps.reasoning ?? d.reasoning ?? false
     const toolcall = caps.function_calling ?? d.tool_call ?? true
     const chat = caps.completion_chat ?? true
+    const context =
+      Number(m.max_context_length) > 0 ? Number(m.max_context_length) : d.limit?.context ?? DEFAULT_LIMIT.context
     const inputs = {
       text: caps.ocr !== true,
       image: image === true,
@@ -189,12 +196,13 @@ async function listModels(key) {
     const model = {
       name: d.name ?? m.id,
       limit: {
-        context: m.max_context_length ?? d.limit?.context ?? DEFAULT_LIMIT.context,
+        context,
         output: d.limit?.output ?? DEFAULT_LIMIT.output,
       },
       tool_call: toolcall,
       attachment: image,
       reasoning,
+      temperature: chat,
       // OpenCode 1.x's model shape, so magpie and 2.x see what the model
       // takes and gives (and leave a TTS or an embedding out of chat lists)
       modalities: { input: modalities(inputs), output: modalities(outputs) },
