@@ -34,6 +34,34 @@ const POLL_EVERY_MS = 1500
 const SIGN_IN_TTL_MS = 10 * 60 * 1000
 const DEFAULT_LIMIT = { context: 262_144, output: 65_536 }
 
+// Prices from https://docs.mistral.ai/inference/pricing (USD per 1M tokens,
+// standard tier), for the current LLM models only. /v1/models names each
+// model's billing model as well (billing_model_name), so an alias such as
+// codestral-latest or mistral-code-latest is priced at the model behind it;
+// a -latest alias is also listed where it is that model's own id. Older
+// generations and the speech, OCR and embedding models keep models.dev's
+// price when it has one.
+const DOCS_PRICES = {
+  "mistral-large-4": { input: 0.7, output: 2.1, cache_read: 0.07 },
+  "mistral-large-4-0": { input: 0.7, output: 2.1, cache_read: 0.07 },
+  "mistral-large-4-0-a": { input: 0.7, output: 2.1, cache_read: 0.07 },
+  "mistral-small-2603": { input: 0.15, output: 0.6, cache_read: 0.015 },
+  "mistral-small-latest": { input: 0.15, output: 0.6, cache_read: 0.015 },
+  "ministral-14b-2512": { input: 0.2, output: 0.2, cache_read: 0.02 },
+  "ministral-14b-latest": { input: 0.2, output: 0.2, cache_read: 0.02 },
+  "ministral-8b-2512": { input: 0.15, output: 0.15, cache_read: 0.015 },
+  "ministral-8b-latest": { input: 0.15, output: 0.15, cache_read: 0.015 },
+  "ministral-3b-2512": { input: 0.1, output: 0.1, cache_read: 0.01 },
+  "ministral-3b-latest": { input: 0.1, output: 0.1, cache_read: 0.01 },
+  "codestral-2508": { input: 0.3, output: 0.9, cache_read: 0.03 },
+  "codestral-latest": { input: 0.3, output: 0.9, cache_read: 0.03 },
+  "zai-glm-5-3": { input: 1.4, output: 4.4, cache_read: 0.14 },
+  "zai-glm-5-3-flash": { input: 0.15, output: 0.5, cache_read: 0.03 },
+  "deepseek-v4-1-flash-1017": { input: 0.3, output: 1.2, cache_read: 0.007 },
+  // mistral-large-latest is deliberately absent: the vendor still bills it as
+  // mistral-large-2512 (Large 3), so models.dev's price for it is the right one.
+}
+
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
     const t = setTimeout(() => {
@@ -114,6 +142,23 @@ async function modelsDev() {
   return devModels
 }
 
+// priceOf is a model's list price as OpenCode and magpie take it: USD per
+// 1M tokens, with the cache read and write beside input and output. docs
+// first, then models.dev, and undefined when nothing prices it rather than
+// a made-up zero.
+function priceOf(m, dev) {
+  const billing = typeof m?.billing_model_name === "string" ? m.billing_model_name : ""
+  const p = DOCS_PRICES[billing] ?? DOCS_PRICES[m?.id] ?? dev?.[billing]?.cost ?? dev?.[m?.id]?.cost
+  if (!p || typeof p !== "object") return undefined
+  const n = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : 0)
+  const cache = p.cache && typeof p.cache === "object" ? p.cache : {}
+  return {
+    input: n(p.input),
+    output: n(p.output),
+    cache: { read: n(p.cache_read ?? cache.read), write: n(p.cache_write ?? cache.write) },
+  }
+}
+
 async function listModels(key) {
   const res = await fetch(`${apiBase()}/models`, {
     headers: { Authorization: `Bearer ${key}` },
@@ -125,14 +170,47 @@ async function listModels(key) {
   const out = {}
   for (const m of j?.data ?? []) {
     if (!m?.id || typeof m.id !== "string") continue
-    const d = dev[m.id] ?? {}
-    out[m.id] = {
-      name: d.name ?? m.id,
-      limit: { context: d.limit?.context ?? DEFAULT_LIMIT.context, output: d.limit?.output ?? DEFAULT_LIMIT.output },
-      tool_call: d.tool_call ?? true,
-      attachment: d.attachment ?? true,
-      reasoning: d.reasoning ?? false,
+    const billing = typeof m.billing_model_name === "string" ? m.billing_model_name : ""
+    const d = dev[m.id] ?? dev[billing] ?? {}
+    const caps = m.capabilities ?? {}
+    const image = caps.vision ?? d.attachment ?? false
+    const reasoning = caps.reasoning ?? d.reasoning ?? false
+    const toolcall = caps.function_calling ?? d.tool_call ?? true
+    const chat = caps.completion_chat ?? true
+    const inputs = {
+      text: caps.ocr !== true,
+      image: image === true,
+      audio: caps.audio === true || caps.audio_transcription === true || caps.audio_transcription_realtime === true,
+      video: false,
+      pdf: Array.isArray(d.modalities?.input) && d.modalities.input.includes("pdf"),
     }
+    const outputs = { text: chat === true, image: false, audio: caps.audio_speech === true, video: false, pdf: false }
+    const modalities = (kinds) => Object.keys(kinds).filter((k) => kinds[k])
+    const model = {
+      name: d.name ?? m.id,
+      limit: {
+        context: m.max_context_length ?? d.limit?.context ?? DEFAULT_LIMIT.context,
+        output: d.limit?.output ?? DEFAULT_LIMIT.output,
+      },
+      tool_call: toolcall,
+      attachment: image,
+      reasoning,
+      // OpenCode 1.x's model shape, so magpie and 2.x see what the model
+      // takes and gives (and leave a TTS or an embedding out of chat lists)
+      modalities: { input: modalities(inputs), output: modalities(outputs) },
+      capabilities: {
+        temperature: chat,
+        reasoning,
+        attachment: image,
+        toolcall,
+        input: inputs,
+        output: outputs,
+        interleaved: false,
+      },
+    }
+    const cost = priceOf(m, dev)
+    if (cost) model.cost = cost
+    out[m.id] = model
   }
   return out
 }
@@ -267,4 +345,4 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
 })
 
 // for tests
-export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, ID, apiBase, consoleApi }
+export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, priceOf, DOCS_PRICES, ID, apiBase, consoleApi }

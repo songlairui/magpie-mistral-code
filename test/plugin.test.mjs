@@ -4,6 +4,7 @@
 // URLs; the plugin reads them per call, so this works whatever order the
 // tests run in.
 import { afterEach, expect, test } from "bun:test"
+import { readFile } from "node:fs/promises"
 import { MistralVibeAuthPlugin, _internal } from "../index.mjs"
 
 const realFetch = globalThis.fetch
@@ -53,7 +54,29 @@ function mockFetch() {
     if (u.pathname === "/v1/models") {
       state.modelsCalls++
       if (h.get("authorization") !== `Bearer ${KEY}`) return json({ error: "unauthorized" }, 401)
-      return json({ object: "list", data: [{ id: "mistral-large-4" }, { id: "devstral-2" }] })
+      return json({
+        object: "list",
+        data: [
+          {
+            id: "mistral-large-4",
+            billing_model_name: "mistral-large-4-0-a",
+            max_context_length: 1048576,
+            capabilities: { function_calling: true, reasoning: true, vision: true },
+          },
+          {
+            id: "codestral-latest",
+            billing_model_name: "codestral-2508",
+            max_context_length: 256000,
+            capabilities: { function_calling: true, reasoning: false, vision: false },
+          },
+          {
+            id: "voxtral-mini-tts-2603",
+            max_context_length: 4096,
+            capabilities: { completion_chat: false, audio_speech: true },
+          },
+          { id: "devstral-2" },
+        ],
+      })
     }
     if (u.pathname === "/v1/billing/subscription")
       return json({ plan_name: "Vibe Pro", vibe_payg_enabled: true })
@@ -155,9 +178,52 @@ test("provider.models lists /v1/models as mistral-vibe models", async () => {
   mockFetch()
   const hooks = await plugin()
   const models = await hooks.provider.models({ models: {} }, { auth: { type: "api", key: KEY } })
-  expect(Object.keys(models).sort()).toEqual(["devstral-2", "mistral-large-4"])
+  expect(Object.keys(models).sort()).toEqual(["codestral-latest", "devstral-2", "mistral-large-4", "voxtral-mini-tts-2603"])
   expect(models["mistral-large-4"].tool_call).toBe(true)
-  expect(models["mistral-large-4"].limit.context).toBeGreaterThan(0)
+  expect(models["mistral-large-4"].limit.context).toBe(1048576)
+  expect(models["mistral-large-4"].capabilities.input.text).toBe(true)
+  expect(models["mistral-large-4"].capabilities.input.image).toBe(true)
+  expect(models["mistral-large-4"].capabilities.output.text).toBe(true)
+  expect(models["mistral-large-4"].cost).toEqual({ input: 0.7, output: 2.1, cache: { read: 0.07, write: 0 } })
+  // an alias is priced at the model the vendor bills it as
+  expect(models["codestral-latest"].cost).toEqual({ input: 0.3, output: 0.9, cache: { read: 0.03, write: 0 } })
+  // a model that gives no text says so, so magpie leaves it out of chat lists
+  expect(models["voxtral-mini-tts-2603"].capabilities.output).toEqual({ text: false, image: false, audio: true, video: false, pdf: false })
+  expect(models["voxtral-mini-tts-2603"].modalities.output).toEqual(["audio"])
+  // a model neither the docs nor models.dev prices has no cost, not a zero
+  expect(models["devstral-2"].cost).toBeUndefined()
+})
+
+test("prices follow the Mistral docs and each model's billing name", () => {
+  const { priceOf } = _internal
+  const large4 = { input: 0.7, output: 2.1, cache: { read: 0.07, write: 0 } }
+  const codestral = { input: 0.3, output: 0.9, cache: { read: 0.03, write: 0 } }
+  expect(priceOf({ id: "mistral-large-4" }, {})).toEqual(large4)
+  expect(priceOf({ id: "mistral-large-4-0", billing_model_name: "mistral-large-4-0-a" }, {})).toEqual(large4)
+  expect(priceOf({ id: "mistral-code-latest", billing_model_name: "codestral-2508" }, {})).toEqual(codestral)
+  expect(priceOf({ id: "deepseek-v4-1-flash-1017" }, {})).toEqual({ input: 0.3, output: 1.2, cache: { read: 0.007, write: 0 } })
+  expect(priceOf({ id: "zai-glm-5-3-flash" }, {})).toEqual({ input: 0.15, output: 0.5, cache: { read: 0.03, write: 0 } })
+  // mistral-large-latest is billed as Mistral Large 3, not as Large 4
+  expect(priceOf({ id: "mistral-large-latest", billing_model_name: "mistral-large-2512" }, {})).toBeUndefined()
+  // models.dev prices a model the docs no longer list
+  expect(priceOf({ id: "mistral-large-2512" }, { "mistral-large-2512": { cost: { input: 0.5, output: 1.5, cache_read: 0.05 } } })).toEqual({
+    input: 0.5,
+    output: 1.5,
+    cache: { read: 0.05, write: 0 },
+  })
+  // nothing known is no price, not a zero
+  expect(priceOf({ id: "unknown" }, {})).toBeUndefined()
+})
+
+test("package.json gives the plugin its own logo", async () => {
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  expect(pkg.magpie.icon.startsWith("data:image/svg+xml;base64,")).toBe(true)
+  const svg = Buffer.from(pkg.magpie.icon.slice(pkg.magpie.icon.indexOf(",") + 1), "base64").toString("utf8")
+  const file = await readFile(new URL("../assets/icon.svg", import.meta.url), "utf8")
+  expect(svg).toBe(file)
+  expect(svg).toContain("<svg")
+  expect(svg).toContain("</svg>")
+  expect(pkg.files).toContain("assets/icon.svg")
 })
 
 test("provider.models falls back to the provider's own list when the key is refused", async () => {
