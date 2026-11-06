@@ -20,7 +20,7 @@ API credits 计费）相互独立：本插件的登录拿到的是 **Vibe Code �
 
 ## 安装
 
-magpie 里 `magpie plugin add github:<你的用户名>/magpie-mistral-code#v0.1.0`（打 tag 安装），
+magpie 里 `magpie plugin add github:songlairui/magpie-mistral-code#v0.1.0`（打 tag 安装），
 然后 `magpie plugin login mistral-vibe`。OpenCode 里把包名加进配置即可。
 
 模型列表来自 `GET /v1/models`，limit 优先取 models.dev 的 `mistral` 目录。

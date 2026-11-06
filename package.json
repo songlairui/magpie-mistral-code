@@ -8,7 +8,7 @@
   "files": ["index.mjs", "opencode.mjs", "opencode2.mjs", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "mistral", "vibe", "vibe-code"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/solary/magpie-mistral-code.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/songlairui/magpie-mistral-code.git" },
   "magpie": {
     "name": "Mistral Vibe Code (unofficial)",
     "summary": {
