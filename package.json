@@ -1,0 +1,19 @@
+{
+  "name": "@solary/magpie-mistral-vibe",
+  "version": "0.1.0",
+  "description": "Mistral Vibe Code subscription as an OpenCode/magpie provider plugin (unofficial): browser sign-in mints an API key that bills the plan's monthly Vibe Code budget on api.mistral.ai",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": { ".": "./opencode2.mjs" },
+  "files": ["index.mjs", "opencode.mjs", "opencode2.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "mistral", "vibe", "vibe-code"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/solary/magpie-mistral-code.git" },
+  "magpie": {
+    "name": "Mistral Vibe Code (unofficial)",
+    "summary": {
+      "en": "Mistral Vibe Code subscription (unofficial): browser sign-in or a Vibe Code API key; chat completions on api.mistral.ai billed to the plan's monthly Vibe Code budget, with plan and budget usage. Separate from the mistral API-key provider.",
+      "zh": "Mistral Vibe Code 订阅（非官方）：浏览器登录或 Vibe Code API key；请求走 api.mistral.ai 并计入套餐月度 Vibe Code 预算，带 plan 与用量显示。与 mistral API key provider（mistral）相互独立。"
+    }
+  }
+}

@@ -1,0 +1,270 @@
+// Mistral Vibe Code, as an OpenCode provider plugin (unofficial), served the
+// way the official mistral-vibe CLI serves it:
+//
+// - Sign-in is the browser sign-in the CLI does: POST console.mistral.ai's
+//   /api/vibe/sign-in with a PKCE challenge, the page it answers with is
+//   opened, its poll_url is read until the browser has signed in, and
+//   POST /api/vibe/sign-in/{process_id}/exchange (exchange_token +
+//   code_verifier) returns an API key. That key is made for Vibe Code: its
+//   calls on api.mistral.ai bill the plan's monthly Vibe Code budget, not
+//   pay-as-you-go API credits. A key made the same way in the console
+//   (Code > Vibe Code CLI) can be pasted instead.
+// - Requests are plain OpenAI chat completions on https://api.mistral.ai/v1
+//   with the key as a bearer token; the models are /v1/models. No private
+//   protocol (the CLI's ACP layer is its IDE control plane, not its model
+//   channel), so the loader only re-signs each request.
+// - Usage is the public billing read the CLI does:
+//   GET api.mistral.ai/v1/billing/subscription (plan name, pay-as-you-go) and
+//   GET api.mistral.ai/v1/billing/budget (vibe_budget: usage_percentage,
+//   initial_budget, reset_at); the plan also comes from console's
+//   /api/vibe/whoami.
+//
+// The provider id is "mistral-vibe", kept apart from the "mistral" preset
+// (api.mistral.ai with the user's own API key).
+import { createHash, randomBytes } from "node:crypto"
+
+const ID = "mistral-vibe"
+
+// bases are functions so tests can point them at a stand-in with the
+// MISTRAL_VIBE_API_BASE / MISTRAL_VIBE_CONSOLE_API environment variables
+const apiBase = () => (process.env.MISTRAL_VIBE_API_BASE || "https://api.mistral.ai/v1").replace(/\/+$/, "")
+const consoleApi = () => (process.env.MISTRAL_VIBE_CONSOLE_API || "https://console.mistral.ai/api").replace(/\/+$/, "")
+
+const POLL_EVERY_MS = 1500
+const SIGN_IN_TTL_MS = 10 * 60 * 1000
+const DEFAULT_LIMIT = { context: 262_144, output: 65_536 }
+
+const sleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(t)
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
+    }
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener("abort", onAbort, { once: true })
+  })
+
+const keyOf = (auth) => (auth?.type === "api" || auth?.key ? auth.key : auth?.access) || ""
+
+// ---- the browser sign-in (vibe's setup/auth/http_browser_sign_in_gateway) ----
+
+const newVerifier = () => randomBytes(48).toString("base64url")
+const challengeOf = (verifier) => createHash("sha256").update(verifier).digest("base64url")
+
+async function startSignIn(signal) {
+  const code_verifier = newVerifier()
+  const res = await fetch(`${consoleApi()}/vibe/sign-in`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code_challenge: challengeOf(code_verifier), code_challenge_method: "S256" }),
+    signal,
+  })
+  if (!res.ok) throw new Error(`Mistral sign-in could not start (${res.status})`)
+  const d = await res.json()
+  if (!d?.process_id || !d?.sign_in_url || !d?.poll_url) throw new Error("Mistral sign-in answered an unexpected payload")
+  return { process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url: d.poll_url, expires_at: d.expires_at, code_verifier }
+}
+
+async function pollSignIn(pollUrl, signal) {
+  const res = await fetch(pollUrl, { signal })
+  if (res.status === 410) return { status: "expired" }
+  if (!res.ok) throw new Error(`Mistral sign-in poll answered ${res.status}`)
+  return await res.json()
+}
+
+async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal) {
+  const res = await fetch(`${consoleApi()}/vibe/sign-in/${encodeURIComponent(processId)}/exchange`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ exchange_token: exchangeToken, code_verifier: codeVerifier }),
+    signal,
+  })
+  if (!res.ok) throw new Error(`Mistral sign-in exchange failed (${res.status})`)
+  const d = await res.json()
+  if (!d?.api_key) throw new Error("Mistral sign-in exchange returned no API key")
+  return d.api_key
+}
+
+// whoami names the plan behind a key (console.mistral.ai/api/vibe/whoami)
+async function whoami(key) {
+  const res = await fetch(`${consoleApi()}/vibe/whoami`, {
+    headers: { Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(8000),
+  })
+  if (!res.ok) return null
+  return await res.json().catch(() => null)
+}
+
+// ---- models: /v1/models, limits filled from models.dev when it knows them ----
+
+let devModels = null
+async function modelsDev() {
+  if (devModels) return devModels
+  try {
+    const res = await fetch("https://models.dev/api.json", { signal: AbortSignal.timeout(5000) })
+    const j = await res.json()
+    devModels = j?.mistral?.models ?? {}
+  } catch {
+    devModels = {}
+  }
+  return devModels
+}
+
+async function listModels(key) {
+  const res = await fetch(`${apiBase()}/models`, {
+    headers: { Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) return null
+  const j = await res.json().catch(() => null)
+  const dev = await modelsDev()
+  const out = {}
+  for (const m of j?.data ?? []) {
+    if (!m?.id || typeof m.id !== "string") continue
+    const d = dev[m.id] ?? {}
+    out[m.id] = {
+      name: d.name ?? m.id,
+      limit: { context: d.limit?.context ?? DEFAULT_LIMIT.context, output: d.limit?.output ?? DEFAULT_LIMIT.output },
+      tool_call: d.tool_call ?? true,
+      attachment: d.attachment ?? true,
+      reasoning: d.reasoning ?? false,
+    }
+  }
+  return out
+}
+
+// ---- usage: the billing reads (vibe's app_server/_billing.py) ----
+
+async function readUsage(key) {
+  const headers = { Authorization: `Bearer ${key}` }
+  const ask = async (url) => {
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) })
+    if (!res.ok) return null
+    return await res.json().catch(() => null)
+  }
+  const [subscription, budget, who] = await Promise.all([
+    ask(`${apiBase()}/billing/subscription`),
+    ask(`${apiBase()}/billing/budget`),
+    whoami(key),
+  ])
+  const plan = subscription?.plan_name || who?.plan_name || undefined
+  const vb = budget?.vibe_budget
+  const windows = []
+  if (vb && typeof vb.usage_percentage === "number") {
+    const resetsAt = vb.reset_at ? Date.parse(vb.reset_at) : NaN
+    const span = Number.isFinite(resetsAt) ? Math.max(3600, Math.floor((resetsAt - Date.now()) / 1000)) : 30 * 86400
+    windows.push({
+      name: "Monthly Vibe Code",
+      used: vb.usage_percentage,
+      resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined,
+      span,
+    })
+  }
+  return { plan, windows, payg: subscription?.vibe_payg_enabled ?? vb?.payg_enabled ?? undefined }
+}
+
+// ---- the plugin ----
+
+export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
+  config: async (cfg) => {
+    cfg.provider ??= {}
+    cfg.provider[ID] ??= {
+      name: "Mistral Vibe Code",
+      npm: "@ai-sdk/openai-compatible",
+      api: apiBase(),
+      models: {},
+    }
+  },
+  auth: {
+    provider: ID,
+    usage: async (getAuth) => {
+      const key = keyOf(await getAuth())
+      if (!key) return { error: "Not signed in", windows: [] }
+      try {
+        const u = await readUsage(key)
+        return { plan: u.plan, windows: u.windows }
+      } catch (e) {
+        return { error: `Mistral billing read failed: ${e?.message ?? e}`, windows: [] }
+      }
+    },
+    loader: async (getAuth) => {
+      const auth = await getAuth()
+      const key = keyOf(auth)
+      if (!key) return {}
+      return {
+        baseURL: apiBase(),
+        apiKey: "mistral-vibe", // the engine's placeholder; the fetch below signs
+        async fetch(input, init = {}) {
+          const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+          headers.set("Authorization", `Bearer ${key}`)
+          return fetch(input, { ...init, headers })
+        },
+      }
+    },
+    methods: [
+      {
+        type: "oauth",
+        label: "Sign in with Mistral (browser)",
+        authorize: async (_inputs, { signal } = {}) => {
+          const p = await startSignIn(signal)
+          return {
+            url: p.sign_in_url,
+            instructions: "Sign in to your Mistral account on the page that opens. The sign-in finishes here by itself.",
+            method: "auto",
+            callback: async (_code, { signal: cbSignal } = {}) => {
+              const s = cbSignal ?? signal
+              const deadline = (Date.parse(p.expires_at) || Date.now() + SIGN_IN_TTL_MS)
+              for (;;) {
+                let r
+                try {
+                  r = await pollSignIn(p.poll_url, s)
+                } catch (e) {
+                  if (Date.now() > deadline) return { type: "failed", error: `Sign-in poll failed: ${e?.message ?? e}` }
+                  await sleep(POLL_EVERY_MS, s)
+                  continue
+                }
+                if (r?.status === "completed" && r.exchange_token) {
+                  try {
+                    const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s)
+                    const who = await whoami(key).catch(() => null)
+                    const out = { type: "success", key, metadata: { plan: who?.plan_name, vibeEntitlement: who?.has_paid_vibe_entitlement } }
+                    if (who?.customer_id != null) out.accountId = String(who.customer_id)
+                    return out
+                  } catch (e) {
+                    return { type: "failed", error: `Sign-in exchange failed: ${e?.message ?? e}` }
+                  }
+                }
+                if (r?.status === "expired") return { type: "failed", error: "The sign-in expired; start it again" }
+                if (r?.status === "denied") return { type: "failed", error: r.message || "The sign-in was denied" }
+                if (r?.status === "error") return { type: "failed", error: r.message || "The sign-in failed" }
+                if (Date.now() > deadline) return { type: "failed", error: "The sign-in timed out; start it again" }
+                await sleep(POLL_EVERY_MS, s)
+              }
+            },
+          }
+        },
+      },
+      {
+        type: "api",
+        label: "Vibe Code API key",
+        placeholder: "key made in console.mistral.ai under Code > Vibe Code CLI",
+      },
+    ],
+  },
+  provider: {
+    id: ID,
+    async models(provider, { auth } = {}) {
+      const key = keyOf(auth)
+      if (!key) return provider?.models ?? {}
+      const got = await listModels(key).catch(() => null)
+      return got && Object.keys(got).length ? got : (provider?.models ?? {})
+    },
+  },
+})
+
+// for tests
+export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, ID, apiBase, consoleApi }
