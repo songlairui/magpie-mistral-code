@@ -13,7 +13,44 @@ process.env.MISTRAL_VIBE_API_BASE = "http://mock.local/v1"
 process.env.MISTRAL_VIBE_CONSOLE_API = "http://mock.local/api"
 
 const KEY = "vibe-key-1"
-const state = { polls: 0, chats: [], exchanges: [], whoamis: 0, modelsCalls: 0 }
+const state = { polls: 0, chats: [], bodies: [], exchanges: [], whoamis: 0, modelsCalls: 0 }
+
+// mistralRefuse answers as api.mistral.ai does a message field it doesn't know
+// (422 extra_forbidden, loc ["body","messages",2,"assistant",
+// "reasoning_content"]), and a thinking part that isn't the list of text
+// chunks it returns: the tests then fail on the shape that was refused in
+// the field. Null when the request is one it takes.
+function mistralRefuse(body) {
+  if (typeof body !== "string") return null
+  let q
+  try {
+    q = JSON.parse(body)
+  } catch {
+    return null
+  }
+  const known = ["role", "content", "tool_calls", "tool_call_id", "name", "prefix"]
+  const detail = []
+  for (const [i, m] of (q?.messages ?? []).entries()) {
+    for (const k of Object.keys(m ?? {})) {
+      if (!known.includes(k))
+        detail.push({ type: "extra_forbidden", loc: ["body", "messages", i, m.role, k], msg: "Extra inputs are not permitted", input: m[k] })
+    }
+    const parts = Array.isArray(m?.content) ? m.content : []
+    for (const [j, p] of parts.entries()) {
+      if (p?.type !== "thinking") continue
+      const chunks = p.thinking
+      const ok = Array.isArray(chunks) && chunks.every((c) => c?.type === "text" && typeof c.text === "string")
+      if (!ok)
+        detail.push({
+          type: "list_type",
+          loc: ["body", "messages", i, "assistant", "content", j, "thinking"],
+          msg: "Input should be a valid list",
+          input: chunks,
+        })
+    }
+  }
+  return detail.length ? detail : null
+}
 
 function mockFetch() {
   globalThis.fetch = async (input, init = {}) => {
@@ -49,6 +86,9 @@ function mockFetch() {
     }
     if (u.pathname === "/v1/chat/completions" && init.method === "POST") {
       state.chats.push(h.get("authorization"))
+      state.bodies.push(init.body)
+      const refused = mistralRefuse(init.body)
+      if (refused) return json({ detail: refused }, 422)
       return json({ id: "chatcmpl-1", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })
     }
     if (u.pathname === "/v1/models") {
@@ -274,4 +314,113 @@ test("api method is offered for pasting a Vibe Code key", async () => {
   const api = hooks.auth.methods.find((m) => m.type === "api")
   expect(api).toBeTruthy()
   expect(typeof api.placeholder).toBe("string")
+})
+
+// api.mistral.ai turns a message field it doesn't know away as 422
+// extra_forbidden, and an earlier assistant turn's thinking comes back from
+// most clients as reasoning_content: it goes in the typed thinking part
+// Mistral returns it in, ahead of the turn's text.
+test("an earlier turn's thinking goes in the typed part Mistral takes", () => {
+  const { mistralBody } = _internal
+  const body = JSON.stringify({
+    model: "deepseek-v4-1-flash-1017",
+    messages: [
+      { role: "user", content: "Is 91 prime?" },
+      { role: "assistant", content: "91 = 7 x 13.", reasoning_content: "7*13=91." },
+      { role: "user", content: "And 97?" },
+    ],
+  })
+  // the stand-in refuses the field the way Mistral does, so what goes out is
+  // pinned to the shape Mistral takes
+  expect(mistralRefuse(body)).toBeTruthy()
+  expect(mistralRefuse(mistralBody(body))).toBeNull()
+  const out = JSON.parse(mistralBody(body))
+  expect(out.messages[0]).toEqual({ role: "user", content: "Is 91 prime?" })
+  expect(out.messages[2]).toEqual({ role: "user", content: "And 97?" })
+  expect(out.messages[1]).toEqual({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: [{ type: "text", text: "7*13=91." }] }, { type: "text", text: "91 = 7 x 13." }],
+  })
+  expect(out.messages[1].reasoning_content).toBeUndefined()
+
+  // a tool-call turn: content null, the thinking part alone, its calls kept
+  const calls = [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }]
+  const toolTurn = JSON.stringify({
+    model: "m",
+    messages: [
+      { role: "user", content: "Read note.txt." },
+      { role: "assistant", content: null, tool_calls: calls, reasoning_content: "Let me read it." },
+      { role: "tool", tool_call_id: "call_1", content: "secret" },
+    ],
+  })
+  const t = JSON.parse(mistralBody(toolTurn))
+  expect(t.messages[1]).toEqual({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: [{ type: "text", text: "Let me read it." }] }],
+    tool_calls: calls,
+  })
+
+  // reasoning and reasoning_details go the same way; a non-assistant message
+  // carrying one loses it and keeps its content
+  const others = JSON.stringify({
+    model: "m",
+    messages: [
+      { role: "user", content: "hi", reasoning: "not a turn's" },
+      { role: "assistant", content: "ok", reasoning_details: [{ type: "reasoning.text", text: "a" }, { summary: "b" }] },
+      { role: "assistant", content: "cut", reasoning_content: "" },
+    ],
+  })
+  const o = JSON.parse(mistralBody(others))
+  expect(o.messages[0]).toEqual({ role: "user", content: "hi" })
+  expect(o.messages[1].content).toEqual([
+    { type: "thinking", thinking: [{ type: "text", text: "ab" }] },
+    { type: "text", text: "ok" },
+  ])
+  expect(o.messages[1].reasoning_details).toBeUndefined()
+  // no thinking at all: the field goes, the turn is left as it was
+  expect(o.messages[2]).toEqual({ role: "assistant", content: "cut" })
+})
+
+// a body with no thinking, or not a chat request's JSON, comes back byte for
+// byte: every other request keeps its bytes on the way
+test("a body with nothing to move comes back untouched", () => {
+  const { mistralBody } = _internal
+  const plain = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] })
+  expect(mistralBody(plain)).toBe(plain)
+  const prefill = JSON.stringify({
+    model: "m",
+    messages: [{ role: "assistant", content: "The answer is", prefix: true, reasoning_content: "think" }],
+  })
+  // a prefill's text is what goes on: its content stays, only the field goes
+  expect(JSON.parse(mistralBody(prefill)).messages[0]).toEqual({ role: "assistant", content: "The answer is", prefix: true })
+  const embeddings = JSON.stringify({ model: "m", input: ["reasoning"] })
+  expect(mistralBody(embeddings)).toBe(embeddings)
+  expect(mistralBody("not json at all, reasoning")).toBe("not json at all, reasoning")
+  expect(mistralBody(undefined)).toBe(undefined)
+})
+
+// and the loader does it on the way out, so a gateway that sends an earlier
+// turn's thinking as reasoning_content reaches Mistral with the part instead
+test("the loader puts an earlier turn's thinking in the typed part", async () => {
+  mockFetch()
+  state.bodies = []
+  const hooks = await plugin()
+  const loader = await hooks.auth.loader(async () => ({ type: "api", key: KEY }))
+  const sent = JSON.stringify({
+    model: "deepseek-v4-1-flash-1017",
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "Let me check.", reasoning_content: "thinking here" },
+      { role: "user", content: "say ok" },
+    ],
+  })
+  const res = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", headers: { "content-length": "999" }, body: sent })
+  expect(res.status).toBe(200)
+  expect(state.bodies).toHaveLength(1)
+  const out = JSON.parse(state.bodies[0])
+  expect(out.messages[1]).toEqual({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: [{ type: "text", text: "thinking here" }] }, { type: "text", text: "Let me check." }],
+  })
+  expect(state.bodies[0]).not.toContain("reasoning_content")
 })

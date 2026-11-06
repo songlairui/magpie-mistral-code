@@ -12,7 +12,10 @@
 // - Requests are plain OpenAI chat completions on https://api.mistral.ai/v1
 //   with the key as a bearer token; the models are /v1/models. No private
 //   protocol (the CLI's ACP layer is its IDE control plane, not its model
-//   channel), so the loader only re-signs each request.
+//   channel), so the loader re-signs each request, and puts an earlier
+//   turn's thinking back in the typed part Mistral takes it (see
+//   mistralBody below): Mistral turns an unknown message field away as 422
+//   extra_forbidden.
 // - Usage is the public billing read the CLI does:
 //   GET api.mistral.ai/v1/billing/subscription (plan name, pay-as-you-go) and
 //   GET api.mistral.ai/v1/billing/budget (vibe_budget: usage_percentage,
@@ -253,6 +256,73 @@ async function readUsage(key) {
   return { plan, windows, payg: subscription?.vibe_payg_enabled ?? vb?.payg_enabled ?? undefined }
 }
 
+// ---- an earlier turn's thinking, in the shape Mistral takes it ----
+
+// api.mistral.ai reads each chat message strictly: a field it doesn't know
+// turns the whole request away as 422 "Extra inputs are not permitted"
+// (extra_forbidden, loc ["body","messages",2,"assistant",
+// "reasoning_content"]). An earlier assistant turn's thinking comes back
+// from most clients in one of these fields — reasoning_content (OpenCode,
+// pi, Claude Code through a gateway), reasoning (OpenRouter's) and
+// reasoning_details (OpenRouter's structured one) — so a conversation with
+// a thinking turn in it never gets through. Mistral returns a thinking turn
+// as a typed content part and takes it back that way, so the thinking goes
+// there, ahead of the turn's own text, as magpie's own Mistral handling
+// gives it (#494).
+const THINKING_FIELDS = ["reasoning_content", "reasoning", "reasoning_details"]
+
+// thinkingText is the thinking a message carries in THINKING_FIELDS.
+function thinkingText(m) {
+  for (const f of THINKING_FIELDS.slice(0, 2)) {
+    const v = m[f]
+    if (typeof v === "string" && v !== "") return v
+  }
+  const details = m.reasoning_details
+  if (!Array.isArray(details)) return ""
+  let out = ""
+  for (const d of details) {
+    if (!d || typeof d !== "object") continue
+    if (typeof d.text === "string" && d.text !== "") out += d.text
+    else if (typeof d.summary === "string") out += d.summary
+  }
+  return out
+}
+
+// asMistralMessage puts one message's thinking where Mistral takes it and
+// says whether it changed anything. A message with no thinking of its own
+// keeps its bytes. A prefill (prefix) keeps its content as it is: its text
+// is what goes on, so the thinking is only dropped there.
+function asMistralMessage(m) {
+  if (!THINKING_FIELDS.some((f) => f in m)) return false
+  const think = thinkingText(m)
+  for (const f of THINKING_FIELDS) delete m[f]
+  if (think === "" || m.role !== "assistant" || m.prefix === true) return true
+  const part = { type: "thinking", thinking: [{ type: "text", text: think }] }
+  const c = m.content
+  if (typeof c === "string") m.content = c === "" ? [part] : [part, { type: "text", text: c }]
+  else if (Array.isArray(c)) m.content = [part, ...c]
+  else m.content = [part]
+  return true
+}
+
+// mistralBody is a chat request's body with every message's thinking in the
+// shape Mistral takes, and without the fields it turns away. A body with no
+// such field comes back as it was, byte for byte, and so does one that isn't
+// a chat request's JSON.
+function mistralBody(body) {
+  if (typeof body !== "string" || !body.includes("reasoning")) return body
+  let q
+  try {
+    q = JSON.parse(body)
+  } catch {
+    return body
+  }
+  if (!q || typeof q !== "object" || !Array.isArray(q.messages)) return body
+  let changed = false
+  for (const m of q.messages) if (m && typeof m === "object" && asMistralMessage(m)) changed = true
+  return changed ? JSON.stringify(q) : body
+}
+
 // ---- the plugin ----
 
 export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
@@ -287,6 +357,12 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
         async fetch(input, init = {}) {
           const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
           headers.set("Authorization", `Bearer ${key}`)
+          const body = mistralBody(init.body)
+          if (body !== init.body) {
+            // the length the engine counted is not the one sent
+            headers.delete("content-length")
+            return fetch(input, { ...init, headers, body })
+          }
           return fetch(input, { ...init, headers })
         },
       }
@@ -353,4 +429,4 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
 })
 
 // for tests
-export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, priceOf, DOCS_PRICES, ID, apiBase, consoleApi }
+export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, priceOf, DOCS_PRICES, mistralBody, THINKING_FIELDS, ID, apiBase, consoleApi }
