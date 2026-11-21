@@ -245,7 +245,14 @@ async function readUsage(key) {
   const windows = []
   if (vb && typeof vb.usage_percentage === "number") {
     const resetsAt = vb.reset_at ? Date.parse(vb.reset_at) : NaN
-    const span = Number.isFinite(resetsAt) ? Math.max(3600, Math.floor((resetsAt - Date.now()) / 1000)) : 30 * 86400
+    const now = new Date()
+    const reset = Number.isFinite(resetsAt)
+      ? new Date(resetsAt)
+      : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+    const lastDay = new Date(Date.UTC(reset.getUTCFullYear(), reset.getUTCMonth(), 0)).getUTCDate()
+    const start = Date.UTC(reset.getUTCFullYear(), reset.getUTCMonth() - 1,
+      Math.min(reset.getUTCDate(), lastDay), reset.getUTCHours(), reset.getUTCMinutes(), reset.getUTCSeconds())
+    const span = Math.max(3600, Math.floor((reset - start) / 1000))
     windows.push({
       name: "Monthly Vibe Code",
       used: vb.usage_percentage,

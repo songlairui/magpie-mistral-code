@@ -52,7 +52,7 @@ function mistralRefuse(body) {
   return detail.length ? detail : null
 }
 
-function mockFetch() {
+function mockFetch({ resetAt = "2099-01-01T00:00:00Z" } = {}) {
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input instanceof Request ? input.url : input)
     const u = new URL(url)
@@ -121,7 +121,7 @@ function mockFetch() {
     if (u.pathname === "/v1/billing/subscription")
       return json({ plan_name: "Vibe Pro", vibe_payg_enabled: true })
     if (u.pathname === "/v1/billing/budget")
-      return json({ vibe_budget: { usage_percentage: 42.5, initial_budget: 100, reset_at: "2099-01-01T00:00:00Z", payg_enabled: true } })
+      return json({ vibe_budget: { usage_percentage: 42.5, initial_budget: 100, reset_at: resetAt, payg_enabled: true } })
     return json({ error: `unexpected ${init.method ?? "GET"} ${u.pathname}` }, 404)
   }
 }
@@ -204,7 +204,16 @@ test("usage reads the monthly Vibe Code budget and the plan", async () => {
   expect(u.windows).toHaveLength(1)
   expect(u.windows[0].used).toBe(42.5)
   expect(u.windows[0].resetsAt).toBe(Date.parse("2099-01-01T00:00:00Z"))
-  expect(u.windows[0].span).toBeGreaterThan(3600)
+  expect(u.windows[0].span).toBe(31 * 86400)
+})
+
+test("usage spans one billing month from the reset day", async () => {
+  const hooks = await plugin()
+  for (const [resetAt, days] of [["2099-01-15T00:00:00Z", 31], ["2099-03-31T00:00:00Z", 31]]) {
+    mockFetch({ resetAt })
+    const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
+    expect(u.windows[0].span).toBe(days * 86400)
+  }
 })
 
 test("usage without a sign-in says so", async () => {
